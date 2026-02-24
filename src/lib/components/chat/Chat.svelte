@@ -51,7 +51,7 @@
 		getMessageContentParts,
 		createMessagesList,
 		getPromptVariables,
-		processDetailsAndExtractToolCalls,
+		processDetails,
 		removeAllDetails,
 		getCodeBlockContents,
 		isYoutubeUrl
@@ -120,6 +120,7 @@
 	let eventConfirmationInput = false;
 	let eventConfirmationInputPlaceholder = '';
 	let eventConfirmationInputValue = '';
+	let eventConfirmationInputType = '';
 	let eventCallback = null;
 
 	let chatIdUnsubscriber: Unsubscriber | undefined;
@@ -160,6 +161,9 @@
 	let files = [];
 	let params = {};
 
+	// Message queue for storing messages while generating
+	let messageQueue: { id: string; prompt: string; files: any[] }[] = [];
+
 	$: if (chatIdProp) {
 		navigateHandler();
 	}
@@ -167,10 +171,16 @@
 	const navigateHandler = async () => {
 		loading = true;
 
+		// Save current queue to sessionStorage before navigating away
+		if (messageQueue.length > 0 && $chatId) {
+			sessionStorage.setItem(`chat-queue-${$chatId}`, JSON.stringify(messageQueue));
+		}
+
 		prompt = '';
 		messageInput?.setText('');
 
 		files = [];
+		messageQueue = [];
 		selectedToolIds = [];
 		selectedFilterIds = [];
 		webSearchEnabled = false;
@@ -186,6 +196,30 @@
 			window.setTimeout(() => scrollToBottom(), 0);
 
 			await tick();
+
+			// Restore queue from sessionStorage
+			const storedQueueData = sessionStorage.getItem(`chat-queue-${chatIdProp}`);
+			if (storedQueueData) {
+				try {
+					const restoredQueue = JSON.parse(storedQueueData);
+
+					if (restoredQueue.length > 0) {
+						sessionStorage.removeItem(`chat-queue-${chatIdProp}`);
+						// Check if there are pending tasks (still generating)
+						const hasPendingTask = taskIds !== null && taskIds.length > 0;
+						if (!hasPendingTask) {
+							// No pending tasks - process the queue
+							files = restoredQueue.flatMap((m) => m.files);
+							await tick();
+							const combinedPrompt = restoredQueue.map((m) => m.prompt).join('\n\n');
+							await submitPrompt(combinedPrompt);
+						} else {
+							// Has pending tasks - show as queued (chatCompletedHandler will process)
+							messageQueue = restoredQueue;
+						}
+					}
+				} catch (e) {}
+			}
 
 			if (storageChatInput) {
 				try {
@@ -296,24 +330,34 @@
 
 			// Set Default Features
 			if (model?.info?.meta?.defaultFeatureIds) {
-				if (model.info?.meta?.capabilities?.['image_generation']) {
+				if (
+					model.info?.meta?.capabilities?.['image_generation'] &&
+					$config?.features?.enable_image_generation &&
+					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+				) {
 					imageGenerationEnabled = model.info.meta.defaultFeatureIds.includes('image_generation');
 				}
 
-				if (model.info?.meta?.capabilities?.['web_search']) {
+				if (
+					model.info?.meta?.capabilities?.['web_search'] &&
+					$config?.features?.enable_web_search &&
+					($user?.role === 'admin' || $user?.permissions?.features?.web_search)
+				) {
 					webSearchEnabled = model.info.meta.defaultFeatureIds.includes('web_search');
 				}
 
-				if (model.info?.meta?.capabilities?.['code_interpreter']) {
+				if (
+					model.info?.meta?.capabilities?.['code_interpreter'] &&
+					$config?.features?.enable_code_interpreter &&
+					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
+				) {
 					codeInterpreterEnabled = model.info.meta.defaultFeatureIds.includes('code_interpreter');
 				}
 			}
 		}
 	};
 
-	const showMessage = async (message, ignoreSettings = false) => {
-		await tick();
-
+	const showMessage = async (message, scroll = true) => {
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 		let _messageId = JSON.parse(JSON.stringify(message.id));
 
@@ -334,17 +378,18 @@
 		history.currentId = _messageId;
 
 		await tick();
-		await tick();
-		await tick();
 
-		if (($settings?.scrollOnBranchChange ?? true) || ignoreSettings) {
+		if (($settings?.scrollOnBranchChange ?? true) && scroll) {
 			const messageElement = document.getElementById(`message-${message.id}`);
 			if (messageElement) {
-				messageElement.scrollIntoView({ behavior: 'smooth' });
+				messageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
 			}
 		}
 
 		await tick();
+		await tick();
+		await tick();
+
 		saveChatHandler(_chatId, history);
 	};
 
@@ -382,6 +427,15 @@
 					message.files = data.files;
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {
 					message.embeds = data.embeds;
+
+					// Auto-scroll to the embed once it's rendered in the DOM
+					await tick();
+					setTimeout(() => {
+						const embedEl = document.getElementById(`${event.message_id}-embeds-container`);
+						if (embedEl) {
+							embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+						}
+					}, 100);
 				} else if (type === 'chat:message:error') {
 					message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
@@ -390,6 +444,9 @@
 					if (autoScroll) {
 						scrollToBottom('smooth');
 					}
+				} else if (type === 'chat:message:favorite') {
+					// Update message favorite status
+					message.favorite = data.favorite;
 				} else if (type === 'chat:title') {
 					chatTitle.set(data);
 					currentChatPage.set(1);
@@ -468,6 +525,7 @@
 					eventConfirmationMessage = data.message;
 					eventConfirmationInputPlaceholder = data.placeholder;
 					eventConfirmationInputValue = data?.value ?? '';
+					eventConfirmationInputType = data?.type ?? '';
 				} else {
 					console.log('Unknown message type', data);
 				}
@@ -775,6 +833,11 @@
 	};
 
 	const uploadWeb = async (urls) => {
+		if ($user?.role !== 'admin' && !($user?.permissions?.chat?.web_upload ?? true)) {
+			toast.error($i18n.t('You do not have permission to upload web content.'));
+			return;
+		}
+
 		if (!Array.isArray(urls)) {
 			urls = [urls];
 		}
@@ -889,15 +952,8 @@
 
 	const initNewChat = async () => {
 		console.log('initNewChat');
-		if ($user?.role !== 'admin') {
-			if ($user?.permissions?.chat?.temporary_enforced) {
-				await temporaryChatEnabled.set(true);
-			}
-
-			if (!$user?.permissions?.chat?.temporary) {
-				await temporaryChatEnabled.set(false);
-				return;
-			}
+		if ($user?.role !== 'admin' && $user?.permissions?.chat?.temporary_enforced) {
+			await temporaryChatEnabled.set(true);
 		}
 
 		if ($settings?.temporaryChatByDefault ?? false) {
@@ -909,9 +965,15 @@
 			}
 		}
 
+		if ($user?.role !== 'admin' && !$user?.permissions?.chat?.temporary) {
+			await temporaryChatEnabled.set(false);
+		}
+
 		const availableModels = $models
 			.filter((m) => !(m?.info?.meta?.hidden ?? false))
 			.map((m) => m.id);
+
+		const defaultModels = $config?.default_models ? $config?.default_models.split(',') : [];
 
 		if ($page.url.searchParams.get('models') || $page.url.searchParams.get('model')) {
 			const urlModels = (
@@ -921,8 +983,8 @@
 			)?.split(',');
 
 			if (urlModels.length === 1) {
-				const m = $models.find((m) => m.id === urlModels[0]);
-				if (!m) {
+				if (!$models.find((m) => m.id === urlModels[0])) {
+					// Model not found; open model selector and prefill
 					const modelSelectorButton = document.getElementById('model-selector-0-button');
 					if (modelSelectorButton) {
 						modelSelectorButton.click();
@@ -936,38 +998,56 @@
 						}
 					}
 				} else {
+					// Model found; set it as selected
 					selectedModels = urlModels;
 				}
 			} else {
+				// Multiple models; set as selected
 				selectedModels = urlModels;
 			}
 
+			// Unavailable models filtering
 			selectedModels = selectedModels.filter((modelId) =>
 				$models.map((m) => m.id).includes(modelId)
 			);
 		} else {
 			if ($selectedFolder?.data?.model_ids) {
+				// Set from folder model IDs
 				selectedModels = $selectedFolder?.data?.model_ids;
 			} else {
 				if (sessionStorage.selectedModels) {
+					// Set from session storage (temporary selection)
 					selectedModels = JSON.parse(sessionStorage.selectedModels);
 					sessionStorage.removeItem('selectedModels');
 				} else {
 					if ($settings?.models) {
+						// Set from user settings
 						selectedModels = $settings?.models;
-					} else if ($config?.default_models) {
-						console.log($config?.default_models.split(',') ?? '');
-						selectedModels = $config?.default_models.split(',');
+					} else if (defaultModels && defaultModels.length > 0) {
+						// Set from default models
+						selectedModels = defaultModels;
 					}
 				}
 			}
 
+			// Unavailable & hidden models filtering
 			selectedModels = selectedModels.filter((modelId) => availableModels.includes(modelId));
 		}
 
+		// Ensure at least one model is selected
 		if (selectedModels.length === 0 || (selectedModels.length === 1 && selectedModels[0] === '')) {
 			if (availableModels.length > 0) {
-				selectedModels = [availableModels?.at(0) ?? ''];
+				if (defaultModels && defaultModels.length > 0) {
+					selectedModels = defaultModels.filter((modelId) => availableModels.includes(modelId));
+				}
+
+				if (
+					selectedModels.length === 0 ||
+					(selectedModels.length === 1 && selectedModels[0] === '')
+				) {
+					// Only fall back to first available model if default models didn't resolve
+					selectedModels = [availableModels?.at(0) ?? ''];
+				}
 			} else {
 				selectedModels = [''];
 			}
@@ -995,6 +1075,8 @@
 
 		chatFiles = [];
 		params = {};
+		taskIds = null;
+		messageQueue = [];
 
 		if ($page.url.searchParams.get('youtube')) {
 			await uploadWeb(`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`);
@@ -1103,7 +1185,7 @@
 
 				if (history.currentId) {
 					for (const message of Object.values(history.messages)) {
-						if (message.role === 'assistant') {
+						if (message && message.role === 'assistant') {
 							message.done = true;
 						}
 					}
@@ -1193,6 +1275,18 @@
 		}
 
 		taskIds = null;
+
+		// Process message queue - combine all queued messages and submit at once
+		if (messageQueue.length > 0) {
+			const combinedPrompt = messageQueue.map((m) => m.prompt).join('\n\n');
+			const combinedFiles = messageQueue.flatMap((m) => m.files);
+			messageQueue = [];
+
+			// Set the files and submit
+			files = combinedFiles;
+			await tick();
+			await submitPrompt(combinedPrompt);
+		}
 	};
 
 	const chatActionHandler = async (_chatId, actionId, modelId, responseMessageId, event = null) => {
@@ -1265,6 +1359,11 @@
 		} else {
 			const modelId = selectedModels[0];
 			const model = $models.filter((m) => m.id === modelId).at(0);
+
+			if (!model) {
+				toast.error($i18n.t('Model not found'));
+				return;
+			}
 
 			const messages = createMessagesList(history, history.currentId);
 			const parentMessage = messages.length !== 0 ? messages.at(-1) : null;
@@ -1382,7 +1481,12 @@
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, sources, selected_model_id, error, usage } = data;
+		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+
+		// Store raw OR-aligned output items from backend
+		if (output) {
+			message.output = output;
+		}
 
 		if (error) {
 			await handleOpenAIError(error, message);
@@ -1580,12 +1684,33 @@
 			return;
 		}
 
+		// Check if there are pending tasks (more reliable than lastMessage.done)
+		if (taskIds !== null && taskIds.length > 0) {
+			if ($settings?.enableMessageQueue ?? true) {
+				// Queue the message
+				const _files = JSON.parse(JSON.stringify(files));
+				messageQueue = [
+					...messageQueue,
+					{
+						id: uuidv4(),
+						prompt: userPrompt,
+						files: _files
+					}
+				];
+				// Clear input
+				messageInput?.setText('');
+				prompt = '';
+				files = [];
+				return;
+			} else {
+				// Interrupt: stop current generation and proceed
+				await stopResponse();
+				await tick();
+			}
+		}
+
 		if (history?.currentId) {
 			const lastMessage = history.messages[history.currentId];
-			if (lastMessage.done != true) {
-				// Response not done
-				return;
-			}
 
 			if (lastMessage.error && !lastMessage.content) {
 				// Error in response
@@ -1731,13 +1856,18 @@
 
 				if (model) {
 					// If there are image files, check if model is vision capable
+					// Skip this check if image generation is enabled, as images may be for editing or are generated outputs in the history
 					const hasImages = createMessagesList(_history, parentId).some((message) =>
 						message.files?.some(
-							(file) => file.type === 'image' || file?.content_type?.startsWith('image/')
+							(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
 						)
 					);
 
-					if (hasImages && !(model.info?.meta?.capabilities?.vision ?? true)) {
+					if (
+						hasImages &&
+						!(model.info?.meta?.capabilities?.vision ?? true) &&
+						!imageGenerationEnabled
+					) {
 						toast.error(
 							$i18n.t('Model {{modelName}} is not vision capable', {
 								modelName: model.name ?? model.id
@@ -1864,79 +1994,50 @@
 			params?.stream_response ??
 			true;
 
-		let messages = [];
-		if (params?.system || $settings.system) {
-			messages.push({
-				role: 'system',
-				content: `${params?.system ?? $settings?.system ?? ''}`
-			});
-		}
-
-		for (const message of _messages) {
-			let content = message?.merged?.content ?? message?.content;
-			content = message?.role !== 'user' ? content?.trim() : content;
-			let processedMessages = processDetailsAndExtractToolCalls(content ?? '');
-
-			let nonToolMesssage = null;
-			let toolCallIndex = 0;
-
-			for (const processedMessage of processedMessages) {
-				if (typeof processedMessage == 'string') {
-					nonToolMesssage = {
-						role: message?.role,
-						content: processedMessage
-					};
-
-					if (
-						message?.role === 'user' &&
-						(message.files?.filter((file) => file.type === 'image').length > 0 ?? false)
-					) {
-						nonToolMesssage.content = [
-							{
-								type: 'text',
-								text: nonToolMesssage.content
-							},
-							...message.files
-								.filter((file) => file.type === 'image')
-								.map((file) => ({
-									type: 'image_url',
-									image_url: {
-										url: file.url
-									}
-								}))
-						];
+		let messages = [
+			params?.system || $settings.system
+				? {
+						role: 'system',
+						content: `${params?.system ?? $settings?.system ?? ''}`
 					}
+				: undefined,
+			..._messages.map((message) => ({
+				...message,
+				content: processDetails(message.content),
+				// Include output for temp chats (backend will use it and strip before LLM)
+				...(message.output ? { output: message.output } : {})
+			}))
+		].filter((message) => message);
 
-					messages.push(nonToolMesssage);
-					continue;
-				}
+		messages = messages
+			.map((message, idx, arr) => {
+				const imageFiles = (message?.files ?? []).filter(
+					(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+				);
 
-				if (!nonToolMesssage) {
-					nonToolMesssage = {
-						role: message?.role,
-						content: ''
-					};
-					messages.push(nonToolMesssage);
-				}
-
-				nonToolMesssage.tool_calls ??= [];
-				nonToolMesssage.tool_calls.push({
-					index: toolCallIndex++,
-					id: processedMessage.id,
-					type: 'function',
-					function: {
-						name: processedMessage.name,
-						arguments: processedMessage.arguments
-					}
-				});
-
-				messages.push({
-					role: 'tool',
-					tool_call_id: processedMessage.id,
-					content: processedMessage.result
-				});
-			}
-		}
+				return {
+					role: message.role,
+					...(message.role === 'user' && imageFiles.length > 0
+						? {
+								content: [
+									{
+										type: 'text',
+										text: message?.merged?.content ?? message.content
+									},
+									...imageFiles.map((file) => ({
+										type: 'image_url',
+										image_url: {
+											url: file.url
+										}
+									}))
+								]
+							}
+						: {
+								content: message?.merged?.content ?? message.content
+							})
+				};
+			})
+			.filter((message) => message?.role === 'user' || message?.content?.trim());
 
 		const toolIds = [];
 		const toolServerIds = [];
@@ -1953,6 +2054,41 @@
 			} else {
 				toolIds.push(toolId);
 			}
+		}
+
+		// Parse skill mentions (<$skillId|label>) from user messages
+		const skillMentionRegex = /<\$([^|>]+)\|?[^>]*>/g;
+		const skillIds = [];
+		for (const message of messages) {
+			const content =
+				typeof message.content === 'string' ? message.content : (message.content?.[0]?.text ?? '');
+			for (const match of content.matchAll(skillMentionRegex)) {
+				if (!skillIds.includes(match[1])) {
+					skillIds.push(match[1]);
+				}
+			}
+		}
+
+		// Strip skill mentions from message content
+		if (skillIds.length > 0) {
+			messages = messages.map((message) => {
+				if (typeof message.content === 'string') {
+					return {
+						...message,
+						content: message.content.replace(/<\$[^>]+>/g, '').trim()
+					};
+				} else if (Array.isArray(message.content)) {
+					return {
+						...message,
+						content: message.content.map((part) =>
+							part.type === 'text'
+								? { ...part, text: part.text.replace(/<\$[^>]+>/g, '').trim() }
+								: part
+						)
+					};
+				}
+				return message;
+			});
 		}
 
 		const res = await generateOpenAIChatCompletion(
@@ -1976,12 +2112,17 @@
 
 				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
 				tool_ids: toolIds.length > 0 ? toolIds : undefined,
+				skill_ids: skillIds.length > 0 ? skillIds : undefined,
 				tool_servers: ($toolServers ?? []).filter(
 					(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
 				),
 				features: getFeatures(),
 				variables: {
-					...getPromptVariables($user?.name, $settings?.userLocation ? userLocation : undefined)
+					...getPromptVariables(
+						$user?.name,
+						$settings?.userLocation ? userLocation : undefined,
+						$user?.email
+					)
 				},
 				model_item: $models.find((m) => m.id === model.id),
 
@@ -2114,8 +2255,10 @@
 
 			const responseMessage = history.messages[history.currentId];
 			// Set all response messages to done
-			for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-				history.messages[messageId].done = true;
+			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
+				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+					history.messages[messageId].done = true;
+				}
 			}
 
 			history.messages[history.currentId] = responseMessage;
@@ -2170,6 +2313,11 @@
 
 		if (history.currentId) {
 			let userMessage = history.messages[message.parentId];
+
+			if (!userMessage) {
+				toast.error($i18n.t('Parent message not found'));
+				return;
+			}
 
 			if (autoScroll) {
 				scrollToBottom();
@@ -2399,6 +2547,7 @@
 	input={eventConfirmationInput}
 	inputPlaceholder={eventConfirmationInputPlaceholder}
 	inputValue={eventConfirmationInputValue}
+	inputType={eventConfirmationInputType}
 	on:confirm={(e) => {
 		if (e.detail) {
 			eventCallback(e.detail);
@@ -2559,6 +2708,34 @@
 									{stopResponse}
 									{createMessagePair}
 									{onUpload}
+									{messageQueue}
+									onQueueSendNow={async (id) => {
+										const item = messageQueue.find((m) => m.id === id);
+										if (item) {
+											// Remove from queue
+											messageQueue = messageQueue.filter((m) => m.id !== id);
+											// Stop current generation first
+											await stopResponse();
+											await tick();
+											// Set files and submit
+											files = item.files;
+											await tick();
+											await submitPrompt(item.prompt);
+										}
+									}}
+									onQueueEdit={(id) => {
+										const item = messageQueue.find((m) => m.id === id);
+										if (item) {
+											// Remove from queue
+											messageQueue = messageQueue.filter((m) => m.id !== id);
+											// Set files and restore prompt to input
+											files = item.files;
+											messageInput?.setText(item.prompt);
+										}
+									}}
+									onQueueDelete={(id) => {
+										messageQueue = messageQueue.filter((m) => m.id !== id);
+									}}
 									onChange={(data) => {
 										if (!$temporaryChatEnabled) {
 											saveDraft(data, $chatId);
