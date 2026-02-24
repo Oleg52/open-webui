@@ -131,6 +131,8 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+    ENABLE_WRAP_TOOL_RESULT,
+    TOOL_RESULT_INDENT_SIZE,
 )
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.constants import TASKS
@@ -380,9 +382,9 @@ def serialize_output(output: list) -> str:
                 files = result_item.get("files")
                 embeds = result_item.get("embeds", "")
 
-                content += f'<details type="tool_calls" done="true" id="{call_id}" name="{name}" arguments="{html.escape(json.dumps(arguments))}" result="{html.escape(json.dumps(result_text, ensure_ascii=False))}" files="{html.escape(json.dumps(files)) if files else ""}" embeds="{html.escape(json.dumps(embeds))}">\n<summary>Tool Executed</summary>\n</details>\n'
+                content += f'<details type="tool_calls" done="true" id="{call_id}" name="{name}" arguments="{html.escape(dump_tool_result_to_json(arguments))}" result="{html.escape(dump_tool_result_to_json(result_text, ensure_ascii=False))}" files="{html.escape(dump_tool_result_to_json(files)) if files else ""}" embeds="{html.escape(dump_tool_result_to_json(embeds))}">\n<summary>Tool Executed</summary>\n</details>\n'
             else:
-                content += f'<details type="tool_calls" done="false" id="{call_id}" name="{name}" arguments="{html.escape(json.dumps(arguments))}">\n<summary>Executing...</summary>\n</details>\n'
+                content += f'<details type="tool_calls" done="false" id="{call_id}" name="{name}" arguments="{html.escape(dump_tool_result_to_json(arguments))}">\n<summary>Executing...</summary>\n</details>\n'
 
         elif item_type == "function_call_output":
             # Already handled inline with function_call above
@@ -1013,14 +1015,21 @@ def process_tool_result(
                     )
                     tool_result.remove(item)
 
-    if isinstance(tool_result, list):
+    if isinstance(tool_result, list) and ENABLE_WRAP_TOOL_RESULT:
         tool_result = {"results": tool_result}
 
     if isinstance(tool_result, dict) or isinstance(tool_result, list):
-        tool_result = json.dumps(tool_result, indent=2, ensure_ascii=False)
+        tool_result = dump_tool_result_to_json(tool_result, ensure_ascii=False)
 
     return tool_result, tool_result_files, tool_result_embeds
 
+
+def dump_tool_result_to_json(model, ensure_ascii=True):
+    indent_size = None if TOOL_RESULT_INDENT_SIZE == 0 else TOOL_RESULT_INDENT_SIZE
+    separators = None if indent_size and indent_size > 0 else (",", ":")
+    return json.dumps(
+        model, indent=indent_size, separators=separators, ensure_ascii=ensure_ascii
+    )
 
 async def chat_completion_tools_handler(
     request: Request, body: dict, extra_params: dict, user: UserModel, models, tools

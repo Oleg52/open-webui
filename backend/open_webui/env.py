@@ -432,6 +432,20 @@ ENABLE_QUERIES_CACHE = os.environ.get("ENABLE_QUERIES_CACHE", "False").lower() =
 
 RAG_SYSTEM_CONTEXT = os.environ.get("RAG_SYSTEM_CONTEXT", "False").lower() == "true"
 
+ENABLE_WRAP_TOOL_RESULT = (
+    os.environ.get("ENABLE_WRAP_TOOL_RESULT", "True").lower() == "true"
+)
+
+TOOL_RESULT_INDENT_SIZE = os.environ.get("TOOL_RESULT_INDENT_SIZE", 2)
+
+if TOOL_RESULT_INDENT_SIZE == "":
+    TOOL_RESULT_INDENT_SIZE = 2
+else:
+    try:
+        TOOL_RESULT_INDENT_SIZE = int(TOOL_RESULT_INDENT_SIZE)
+    except Exception:
+        TOOL_RESULT_INDENT_SIZE = 2
+
 ####################################
 # REDIS
 ####################################
